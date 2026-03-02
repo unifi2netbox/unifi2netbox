@@ -1,4 +1,4 @@
-# unifi2netbox
+w# unifi2netbox
 
 Production-focused synchronization from UniFi controllers to NetBox.
 
@@ -248,7 +248,7 @@ If my repositories are useful:
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=patricklind/unifi2netbox&type=date&legend=top-left)](https://www.star-history.com/#patricklind/unifi2netbox&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=unifi2netbox/unifi2netbox&type=date&legend=top-left)](https://www.star-history.com/#unifi2netbox/unifi2netbox&type=date&legend=top-left)
 
 ## License
 
