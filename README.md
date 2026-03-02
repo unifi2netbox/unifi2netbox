@@ -241,12 +241,12 @@ Set either to `false` only if you explicitly accept the risk (for example lab en
 If my repositories are useful:
 
 <p align="center">
-  <a href="https://ko-fi.com/patricklind">
-    <img src="https://storage.ko-fi.com/cdn/kofi6.png?v=6" height="50"/>
+  <a href="https://ko-fi.com/patricklind" title="Support on Ko-fi">
+    <img src="https://storage.ko-fi.com/cdn/kofi6.png?v=6" height="50" alt="Support on Ko-fi"/>
   </a>
-  <br/>
-  <a href="https://www.buymeacoffee.com/patricklind">
-    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" height="50"/>
+  &nbsp;&nbsp;
+  <a href="https://www.buymeacoffee.com/patricklind" title="Support on Buy Me a Coffee">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" height="50" alt="Support on Buy Me a Coffee"/>
   </a>
 </p>
 
