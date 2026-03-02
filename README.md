@@ -54,6 +54,12 @@ docker compose up --build -d
 docker compose logs -f
 ```
 
+Published container images:
+- `ghcr.io/patricklind/unifi2netbox:latest` (default branch)
+- `ghcr.io/patricklind/unifi2netbox:<branch>`
+- `ghcr.io/patricklind/unifi2netbox:<git-sha>`
+- `ghcr.io/patricklind/unifi2netbox:<tag>` (for `v*` tags)
+
 Behavior:
 - `.env.example` sets `SYNC_INTERVAL=600` (10 minutes)
 - If `SYNC_INTERVAL` is unset, code default is `0` (run once, then exit)
