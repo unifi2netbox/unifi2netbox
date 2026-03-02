@@ -241,6 +241,10 @@ Set either to `false` only if you explicitly accept the risk (for example lab en
 If my repositories are useful:
 
 <p align="center">
+  <a href="https://ko-fi.com/patricklind">
+    <img src="https://storage.ko-fi.com/cdn/kofi6.png?v=6" height="50"/>
+  </a>
+  <br/>
   <a href="https://www.buymeacoffee.com/patricklind">
     <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" height="50"/>
   </a>
