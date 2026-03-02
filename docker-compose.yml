@@ -1,8 +1,6 @@
 services:
   unifi2netbox:
-    build:
-      context: .
-    image: unifi2netbox:latest
+    image: ghcr.io/patricklind/unifi2netbox:latest
     container_name: unifi2netbox
     env_file:
       - .env

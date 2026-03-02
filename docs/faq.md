@@ -124,7 +124,8 @@ docker compose logs -f
 
 ```bash
 git pull
-docker compose up --build -d
+docker compose pull
+docker compose up -d
 ```
 
 ### Can I use Docker Compose with multiple environments?
