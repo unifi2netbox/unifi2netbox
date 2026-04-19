@@ -387,14 +387,6 @@ def set_unifi_device_static_ip(
     For Legacy API: PUT /api/s/{site}/rest/device/{id}
     """
     device_id = device.get("id") or device.get("_id")
-    device_name = (
-        device.get("name")
-        or device.get("hostname")
-        or device.get("macAddress")
-        or device.get("mac")
-        or device.get("id")
-        or "unknown-device"
-    )
     if not device_id:
         logger.warning("Cannot set static IP: missing UniFi device ID")
         return False
