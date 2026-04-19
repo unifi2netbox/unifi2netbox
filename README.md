@@ -257,3 +257,31 @@ If my repositories are useful:
 ## License
 
 MIT (`LICENSE`).
+
+
+## Maintainer Release (PyPI)
+
+Version bump locations for each release:
+- `pyproject.toml` → `[project].version`
+- `netbox_unifi_sync/version.py` → `__version__`
+- `netbox-plugin.yaml` → `compatibility[].release`
+
+Tagging options:
+1. Recommended: run GitHub Actions **Create Release Tag** workflow manually and provide `X.Y.Z`.
+2. Manual git tagging:
+   ```bash
+   git tag -a vX.Y.Z -m "Release vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+Workflow chain:
+- `release.yml` runs on `v*` tag push, gates on lint + tests, then creates the GitHub Release.
+- `publish-python-package.yml` runs on `release: published` and publishes to PyPI.
+- `publish-python-package.yml` can also be run manually for a publish retry.
+
+PyPI Trusted Publisher (OIDC) setup:
+1. In PyPI, open project settings → **Publishing** → **Add a publisher**.
+2. Set owner to this GitHub org/user, repository to `unifi2netbox`.
+3. Set workflow to `.github/workflows/publish-python-package.yml`.
+4. Set environment to `pypi` (must match workflow environment).
+5. Save and test by publishing a tagged release.

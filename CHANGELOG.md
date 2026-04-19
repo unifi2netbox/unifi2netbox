@@ -5,6 +5,8 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- Python packaging metadata added (`pyproject.toml`, `netbox_unifi_sync/version.py`, `netbox-plugin.yaml`) to support PyPI releases.
+- GitHub Actions release pipeline updated for tag-driven GitHub Releases and PyPI trusted publishing via OIDC.
 - Gateway and DNS are now read from UniFi network config (`gateway_ip`, `dhcpd_dns_1-4`) for DHCP-to-static IP conversion.
 - Fallback env vars `DEFAULT_GATEWAY` and `DEFAULT_DNS` when UniFi network config lacks gateway/DNS.
 - 20 new unit tests covering `_get_network_info_for_ip`, `extract_dhcp_ranges_from_unifi` network info, and `is_ip_in_dhcp_range`.
