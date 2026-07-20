@@ -53,6 +53,15 @@ MAX_DEVICE_THREADS = _read_env_int("MAX_DEVICE_THREADS", default=8, minimum=1)
 # See has_keep_tag() / should_preserve_field() for usage.
 KEEP_EXISTING_SETTINGS = load_keep_existing_settings()
 
+# Optional comma-separated list of tag names attached to every synced device.
+# Empty by default — no implicit tag is added. Previous versions hardcoded
+# "zabbix"; existing users who relied on that should set NETBOX_DEVICE_TAGS=zabbix.
+NETBOX_DEVICE_TAGS: tuple[str, ...] = tuple(
+    t.strip()
+    for t in (os.getenv("NETBOX_DEVICE_TAGS") or "").split(",")
+    if t.strip()
+)
+
 # Populated at runtime from NETBOX roles in environment variables
 netbox_device_roles = {}
 postable_fields_cache = {}
@@ -184,31 +193,31 @@ def prepare_netbox_sites(netbox_sites):
     """
     return {netbox_site.name: netbox_site for netbox_site in netbox_sites}
 
-def match_sites_to_netbox(ubiquity_desc, netbox_sites_dict, config=None):
+def match_sites_to_netbox(ubiquiti_desc, netbox_sites_dict, config=None):
     """
-    Match Ubiquity site to NetBox site using the site mapping configuration.
+    Match Ubiquiti site to NetBox site using the site mapping configuration.
 
-    :param ubiquity_desc: The description of the Ubiquity site.
+    :param ubiquiti_desc: The description of the Ubiquiti site.
     :param netbox_sites_dict: A dictionary mapping NetBox site names to site objects.
     :param config: Runtime configuration dictionary
     :return: The matched NetBox site, or None if no match is found.
     """
     # Get the corresponding NetBox site name from the mapping
-    netbox_site_name = get_netbox_site_name(ubiquity_desc, config)
-    logger.debug(f'Mapping Ubiquity site: "{ubiquity_desc}" -> "{netbox_site_name}"')
+    netbox_site_name = get_netbox_site_name(ubiquiti_desc, config)
+    logger.debug(f'Mapping Ubiquiti site: "{ubiquiti_desc}" -> "{netbox_site_name}"')
     
     # Look for exact match in NetBox sites
     if netbox_site_name in netbox_sites_dict:
         netbox_site = netbox_sites_dict[netbox_site_name]
-        logger.debug(f'Matched Ubiquity site "{ubiquity_desc}" to NetBox site "{netbox_site.name}"')
+        logger.debug(f'Matched Ubiquiti site "{ubiquiti_desc}" to NetBox site "{netbox_site.name}"')
         return netbox_site
     
     # If site mapping exists but no match found, provide more helpful message
     if config and 'UNIFI' in config and ('USE_SITE_MAPPING' in config['UNIFI'] and config['UNIFI']['USE_SITE_MAPPING'] or 
                                         'SITE_MAPPINGS' in config['UNIFI'] and config['UNIFI']['SITE_MAPPINGS']):
-        logger.debug(f'No match found for Ubiquity site "{ubiquity_desc}". Add mapping in UNIFI_SITE_MAPPINGS.')
+        logger.debug(f'No match found for Ubiquiti site "{ubiquiti_desc}". Add mapping in UNIFI_SITE_MAPPINGS.')
     else:
-        logger.debug(f'No match found for Ubiquity site "{ubiquity_desc}". Set UNIFI_SITE_MAPPINGS in .env if needed.')
+        logger.debug(f'No match found for Ubiquiti site "{ubiquiti_desc}". Set UNIFI_SITE_MAPPINGS in .env if needed.')
     return None
 
 def setup_logging(min_log_level=logging.INFO):
@@ -1596,7 +1605,7 @@ def _ensure_device_type_specs_inner(nb, nb_device_type, model, specs):
         _sync_templates(nb, nb_device_type, model, nb.dcim.power_port_templates, expected_power, "power-port")
 
 
-def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ips=None, unifi_site_obj=None):
+def process_device(unifi, nb, site, device, nb_ubiquiti, tenant, unifi_device_ips=None, unifi_site_obj=None):
     """Process a device and add it to NetBox."""
     try:
         device_name = get_device_name(device)
@@ -1630,15 +1639,15 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
             logger.debug(f"Running without VRF for site {site.name} (mode={vrf_mode})")
 
         # Device Type creation
-        logger.debug(f"Checking for existing device type: {device_model} (manufacturer ID: {nb_ubiquity.id})")
-        nb_device_type = nb.dcim.device_types.get(model=device_model, manufacturer_id=nb_ubiquity.id)
+        logger.debug(f"Checking for existing device type: {device_model} (manufacturer ID: {nb_ubiquiti.id})")
+        nb_device_type = nb.dcim.device_types.get(model=device_model, manufacturer_id=nb_ubiquiti.id)
         if not nb_device_type:
             # Pre-populate from community specs when creating a new device type
             specs = _resolve_device_specs(device_model)
             create_data = {
-                "manufacturer": nb_ubiquity.id,
+                "manufacturer": nb_ubiquiti.id,
                 "model": device_model,
-                "slug": (specs or {}).get("slug") or slugify(f'{nb_ubiquity.name}-{device_model}'),
+                "slug": (specs or {}).get("slug") or slugify(f'{nb_ubiquiti.name}-{device_model}'),
             }
             if specs:
                 if specs.get("part_number"):
@@ -1663,10 +1672,10 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                 error_message = str(e).lower()
                 if "duplicate key value violates unique constraint" in error_message:
                     # Race condition guard: another worker may have created the same type just before us.
-                    nb_device_type = nb.dcim.device_types.get(model=device_model, manufacturer_id=nb_ubiquity.id)
+                    nb_device_type = nb.dcim.device_types.get(model=device_model, manufacturer_id=nb_ubiquiti.id)
                     if not nb_device_type and create_data.get("part_number"):
                         nb_device_type = nb.dcim.device_types.get(
-                            part_number=create_data["part_number"], manufacturer_id=nb_ubiquity.id
+                            part_number=create_data["part_number"], manufacturer_id=nb_ubiquiti.id
                         )
                     if nb_device_type:
                         logger.debug(
@@ -1797,15 +1806,19 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                     return
 
         if nb_device:
-            # Ensure "zabbix" tag is present
-            zabbix_tag = ensure_tag(nb, "zabbix")
-            if zabbix_tag:
+            # Attach any configured device tags (NETBOX_DEVICE_TAGS env).
+            if NETBOX_DEVICE_TAGS:
                 current_tags = [t.id for t in (nb_device.tags or [])]
-                if zabbix_tag.id not in current_tags:
-                    current_tags.append(zabbix_tag.id)
+                added = False
+                for tag_name in NETBOX_DEVICE_TAGS:
+                    tag_obj = ensure_tag(nb, tag_name)
+                    if tag_obj and tag_obj.id not in current_tags:
+                        current_tags.append(tag_obj.id)
+                        added = True
+                if added:
                     nb_device.tags = current_tags
                     nb_device.save()
-                    logger.info(f"Added 'zabbix' tag to device {device_name}.")
+                    logger.info(f"Added tag(s) to device {device_name}: {', '.join(NETBOX_DEVICE_TAGS)}.")
 
             # Sync device state (ONLINE/OFFLINE -> active/offline)
             if should_preserve_field(nb_device, "status"):
@@ -1980,7 +1993,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
     except Exception as e:
         logger.exception(f"Failed to process device {get_device_name(device)} at site {site}: {e}")
 
-def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, tenant):
+def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquiti, tenant):
     """
     Process devices for a given site and add them to NetBox.
     Also syncs VLANs, WiFi SSIDs, and uplink cables.
@@ -2039,7 +2052,7 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, t
             with ThreadPoolExecutor(max_workers=MAX_DEVICE_THREADS) as executor:
                 futures = []
                 for device in devices:
-                    futures.append(executor.submit(process_device, unifi, nb, nb_site, device, nb_ubiquity, tenant, unifi_device_ips=unifi_device_ips, unifi_site_obj=site_obj))
+                    futures.append(executor.submit(process_device, unifi, nb, nb_site, device, nb_ubiquiti, tenant, unifi_device_ips=unifi_device_ips, unifi_site_obj=site_obj))
 
                 for future in as_completed(futures):
                     try:
@@ -2124,7 +2137,7 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, t
     except Exception as e:
         logger.error(f"Failed to process site {site_display_name}: {e}")
 
-def process_controller(unifi_url, unifi_username, unifi_password, unifi_mfa_secret, unifi_api_key, unifi_api_key_header, nb, nb_ubiquity, tenant,
+def process_controller(unifi_url, unifi_username, unifi_password, unifi_mfa_secret, unifi_api_key, unifi_api_key_header, nb, nb_ubiquiti, tenant,
                        netbox_sites_dict, config=None):
     """
     Process all sites and devices for a specific UniFi controller.
@@ -2157,10 +2170,10 @@ def process_controller(unifi_url, unifi_username, unifi_password, unifi_mfa_secr
                 nb_site = match_sites_to_netbox(site_name, netbox_sites_dict, config)
 
                 if not nb_site:
-                    logger.warning(f"No match found for Ubiquity site: {site_name}. Skipping...")
+                    logger.warning(f"No match found for Ubiquiti site: {site_name}. Skipping...")
                     continue
 
-                futures.append(executor.submit(process_site, unifi, nb, site_obj, site_name, nb_site, nb_ubiquity, tenant))
+                futures.append(executor.submit(process_site, unifi, nb, site_obj, site_name, nb_site, nb_ubiquiti, tenant))
 
             # Wait for all site-processing threads to complete
             for future in as_completed(futures):
@@ -2168,7 +2181,7 @@ def process_controller(unifi_url, unifi_username, unifi_password, unifi_mfa_secr
     except Exception as e:
         logger.error(f"Error processing controller {unifi_url}: {e}")
 
-def process_all_controllers(unifi_url_list, unifi_username, unifi_password, unifi_mfa_secret, unifi_api_key, unifi_api_key_header, nb, nb_ubiquity, tenant,
+def process_all_controllers(unifi_url_list, unifi_username, unifi_password, unifi_mfa_secret, unifi_api_key, unifi_api_key_header, nb, nb_ubiquiti, tenant,
                             netbox_sites_dict, config=None):
     """
     Process all UniFi controllers in parallel.
@@ -2185,7 +2198,7 @@ def process_all_controllers(unifi_url_list, unifi_username, unifi_password, unif
                 unifi_api_key,
                 unifi_api_key_header,
                 nb,
-                nb_ubiquity,
+                nb_ubiquiti,
                 tenant,
                 netbox_sites_dict,
                 config,
@@ -2321,9 +2334,9 @@ def cleanup_orphan_cables(nb, nb_site):
     return deleted
 
 
-def cleanup_device_types(nb, nb_ubiquity):
+def cleanup_device_types(nb, nb_ubiquiti):
     """Refresh device type specs and delete unused device types (device_count == 0)."""
-    all_types = list(nb.dcim.device_types.filter(manufacturer_id=nb_ubiquity.id))
+    all_types = list(nb.dcim.device_types.filter(manufacturer_id=nb_ubiquiti.id))
     refreshed = 0
     deleted = 0
     for dt in all_types:
@@ -2349,7 +2362,7 @@ def cleanup_device_types(nb, nb_ubiquity):
     return deleted
 
 
-def run_netbox_cleanup(nb, nb_ubiquity, tenant, netbox_sites_dict, all_unifi_serials_by_site):
+def run_netbox_cleanup(nb, nb_ubiquiti, tenant, netbox_sites_dict, all_unifi_serials_by_site):
     """Orchestrate all cleanup functions."""
     if not _is_cleanup_enabled():
         logger.debug("NetBox cleanup is disabled (NETBOX_CLEANUP != true)")
@@ -2380,7 +2393,7 @@ def run_netbox_cleanup(nb, nb_ubiquity, tenant, netbox_sites_dict, all_unifi_ser
         logger.warning(f"Cleanup error (orphan IPs): {e}")
 
     try:
-        cleanup_device_types(nb, nb_ubiquity)
+        cleanup_device_types(nb, nb_ubiquiti)
     except Exception as e:
         logger.warning(f"Cleanup error (device types): {e}")
 
@@ -2454,7 +2467,20 @@ if __name__ == "__main__":
     nb.http_session = session  # Attach the custom session
     logger.debug("NetBox API connection established")
 
-    nb_ubiquity = nb.dcim.manufacturers.get(slug='ubiquity')
+    # Manufacturer slug is configurable so existing installs (created when the
+    # slug was hardcoded to 'ubiquity') can keep using their data, while new
+    # installs default to the correctly-spelled 'ubiquiti'.
+    manufacturer_slug = (os.getenv("UNIFI_MANUFACTURER_SLUG") or "ubiquiti").strip().lower() or "ubiquiti"
+    nb_ubiquiti = nb.dcim.manufacturers.get(slug=manufacturer_slug)
+    if not nb_ubiquiti and manufacturer_slug != "ubiquity":
+        # Legacy fallback for installs created when slug was hardcoded to 'ubiquity'.
+        nb_ubiquiti = nb.dcim.manufacturers.get(slug="ubiquity")
+        if nb_ubiquiti:
+            logger.info(
+                f"Using legacy manufacturer slug 'ubiquity' (ID {nb_ubiquiti.id}). "
+                f"To migrate: rename the manufacturer in NetBox to slug '{manufacturer_slug}' "
+                f"or set UNIFI_MANUFACTURER_SLUG=ubiquity explicitly."
+            )
     try:
         tenant_name = config['NETBOX']['TENANT']
     except (KeyError, TypeError):
@@ -2528,10 +2554,10 @@ if __name__ == "__main__":
     netbox_sites_dict = prepare_netbox_sites(netbox_sites)
     logger.debug(f"Prepared {len(netbox_sites_dict)} NetBox sites for mapping")
 
-    if not nb_ubiquity:
-        nb_ubiquity = nb.dcim.manufacturers.create({'name': 'Ubiquity Networks', 'slug': 'ubiquity'})
-        if nb_ubiquity:
-            logger.info(f"Ubiquity manufacturer with ID {nb_ubiquity.id} successfully added to Netbox.")
+    if not nb_ubiquiti:
+        nb_ubiquiti = nb.dcim.manufacturers.create({'name': 'Ubiquiti', 'slug': manufacturer_slug})
+        if nb_ubiquiti:
+            logger.info(f"Ubiquiti manufacturer with ID {nb_ubiquiti.id} successfully added to Netbox.")
 
     # Sync loop — run once or continuously based on SYNC_INTERVAL
     sync_interval = _sync_interval_seconds()
@@ -2555,11 +2581,11 @@ if __name__ == "__main__":
 
         # Process all UniFi controllers in parallel
         process_all_controllers(unifi_url_list, unifi_username, unifi_password, unifi_mfa_secret,
-                                unifi_api_key, unifi_api_key_header, nb, nb_ubiquity,
+                                unifi_api_key, unifi_api_key_header, nb, nb_ubiquiti,
                                 tenant, netbox_sites_dict, config)
 
         # Run cleanup after sync
-        run_netbox_cleanup(nb, nb_ubiquity, tenant, netbox_sites_dict, _cleanup_serials_by_site)
+        run_netbox_cleanup(nb, nb_ubiquiti, tenant, netbox_sites_dict, _cleanup_serials_by_site)
 
         logger.info(f"=== Sync run #{run_count} complete ===")
 
