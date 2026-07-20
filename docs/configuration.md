@@ -132,6 +132,44 @@ To avoid UniFi writeback entirely, disable DHCP conversion inputs:
 | `SYNC_CABLES` | `true` | Sync uplink cables |
 | `SYNC_STALE_CLEANUP` | `true` | Mark missing devices offline |
 
+## Preserve Manual Overrides
+
+Existing NetBox devices are matched **globally by serial** (not scoped to a
+site), and the script never auto-moves a device between sites — if you
+relocate a device in NetBox, the next sync keeps it where you put it.
+
+The flags below additionally protect individual fields from being overwritten
+on every sync run. This is useful when an admin has manually edited a device
+in NetBox and wants those edits to survive subsequent syncs.
+
+| Variable | Default | Description |
+|---|---|---|
+| `KEEP_EXISTING_NAME` | `false` | Do not overwrite `name` on existing devices |
+| `KEEP_EXISTING_DEVICE_TYPE` | `false` | Do not overwrite `device_type` |
+| `KEEP_EXISTING_ASSET_TAG` | `false` | Do not overwrite `asset_tag` |
+| `KEEP_EXISTING_STATUS` | `false` | Do not sync active/offline status from UniFi |
+| `KEEP_EXISTING_INTERFACES` | `false` | Do not sync physical/radio interfaces |
+| `KEEP_EXISTING_CUSTOM_FIELDS` | `false` | Do not sync firmware/uptime/MAC/last_seen custom fields |
+
+`site`, `tenant`, and `role` are **always** preserved on existing devices
+(they are only set when a device is first created); there are no flags for
+these fields.
+
+### Per-device override tags
+
+For finer-grained control, attach one of these tags to a device in NetBox.
+A tag takes precedence over the global `KEEP_EXISTING_*` flags.
+
+| Tag | Effect |
+|---|---|
+| `unifi-keep-name` | Preserve `name` on this device |
+| `unifi-keep-device-type` | Preserve `device_type` |
+| `unifi-keep-asset-tag` | Preserve `asset_tag` |
+| `unifi-keep-status` | Preserve `status` |
+| `unifi-keep-interfaces` | Skip interface sync |
+| `unifi-keep-custom-fields` | Skip custom-field sync |
+| `unifi-keep-all` | Catch-all: protect every field above |
+
 ## Threading
 
 | Variable | Default in code |
