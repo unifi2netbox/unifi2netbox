@@ -28,6 +28,7 @@ from sync.runtime_config import (
     _parse_env_bool,
     _read_env_int,
     _sync_interval_seconds,
+    load_keep_existing_settings,
     load_runtime_config,
 )
 from sync.runtime_config import _unifi_verify_ssl  # noqa: F401
@@ -47,6 +48,10 @@ logger = logging.getLogger(__name__)
 MAX_CONTROLLER_THREADS = _read_env_int("MAX_CONTROLLER_THREADS", default=5, minimum=1)
 MAX_SITE_THREADS = _read_env_int("MAX_SITE_THREADS", default=8, minimum=1)
 MAX_DEVICE_THREADS = _read_env_int("MAX_DEVICE_THREADS", default=8, minimum=1)
+
+# Field-preservation flags loaded once from KEEP_EXISTING_* env vars.
+# See has_keep_tag() / should_preserve_field() for usage.
+KEEP_EXISTING_SETTINGS = load_keep_existing_settings()
 
 # Populated at runtime from NETBOX roles in environment variables
 netbox_device_roles = {}
@@ -269,6 +274,55 @@ def extract_asset_tag(device_name: str | None) -> str | None:
     if match:
         return match.group(1).upper()
     return None
+
+
+# ---------------------------------------------------------------------------
+#  Manual-override preservation
+# ---------------------------------------------------------------------------
+# When an existing NetBox device has an `unifi-keep-<field>` tag (or the
+# catch-all `unifi-keep-all`), the corresponding field is left untouched on
+# every sync run. This lets admins manually edit a device in NetBox and
+# protect those edits from being overwritten.
+# ---------------------------------------------------------------------------
+KEEP_TAG_PREFIX = "unifi-keep-"
+
+
+def _device_tag_slugs(nb_device) -> set[str]:
+    """Return the set of tag slugs attached to a NetBox device (empty if none)."""
+    tags = getattr(nb_device, "tags", None) or []
+    slugs = set()
+    for tag in tags:
+        slug = getattr(tag, "slug", None) or str(tag)
+        slugs.add(str(slug))
+    return slugs
+
+
+def has_keep_tag(nb_device, field: str) -> bool:
+    """
+    Return True if the device is tagged to preserve `field`.
+
+    Recognizes both `unifi-keep-<field>` and the catch-all `unifi-keep-all`.
+    `field` is matched verbatim against the tag suffix (e.g. "name", "device_type").
+    """
+    if nb_device is None:
+        return False
+    slugs = _device_tag_slugs(nb_device)
+    return f"{KEEP_TAG_PREFIX}{field}" in slugs or f"{KEEP_TAG_PREFIX}all" in slugs
+
+
+def should_preserve_field(nb_device, field: str) -> bool:
+    """
+    Decide whether to preserve an existing field on the device.
+
+    Priority: tag (`unifi-keep-<field>` or `unifi-keep-all`) > global env
+    flag (`KEEP_EXISTING_<FIELD>`) > False (default behavior).
+
+    `field` uses the lower-case names from KEEP_EXISTING_SETTINGS keys
+    ("name", "device_type", "asset_tag", "status", "interfaces", "custom_fields").
+    """
+    if has_keep_tag(nb_device, field):
+        return True
+    return bool(KEEP_EXISTING_SETTINGS.get(field, False))
 
 
 def get_device_mac(device: dict) -> str | None:
@@ -1578,13 +1632,31 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
         # Ensure device type has correct specs (ports, PoE, part number, etc.)
         ensure_device_type_specs(nb, nb_device_type, device_model)
 
-        # Check for existing device
+        # Check for existing device — global lookup by serial (not site-bound).
+        # Site/tenant/role are never overwritten on existing devices; if a device
+        # was manually moved to a different site it will still be found here and
+        # kept at its current site.
         logger.debug(f"Checking if device already exists: {device_name} (serial: {device_serial})")
-        nb_device = nb.dcim.devices.get(site_id=site.id, serial=device_serial)
+        existing_devices = list(nb.dcim.devices.filter(serial=device_serial))
+        if len(existing_devices) > 1:
+            logger.warning(
+                f"Multiple NetBox devices share serial {device_serial} "
+                f"(found {len(existing_devices)}). Using first: {existing_devices[0].name}."
+            )
+        nb_device = existing_devices[0] if existing_devices else None
         if nb_device:
+            nb_site = getattr(nb_device, "site", None)
+            nb_site_id = getattr(nb_site, "id", None) if nb_site else None
+            if nb_site_id is not None and nb_site_id != site.id:
+                current_site_name = getattr(nb_site, "name", None) or "?"
+                logger.info(
+                    f"Device {device_name} (serial {device_serial}) exists at site "
+                    f"'{current_site_name}' (mapping target: '{site.name}'). "
+                    f"Keeping current site; not moving."
+                )
             logger.info(f"Device {device_name} with serial {device_serial} already exists. Checking IP...")
-            # Update device name if changed in UniFi
-            if nb_device.name != device_name:
+            # Update device name if changed in UniFi (unless preserved)
+            if not should_preserve_field(nb_device, "name") and nb_device.name != device_name:
                 old_name = nb_device.name
                 nb_device.name = device_name
                 try:
@@ -1593,18 +1665,26 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                 except pynetbox.core.query.RequestError as e:
                     logger.warning(f"Failed to update device name to '{device_name}': {e}")
                     nb_device.name = old_name  # Revert on failure
-            # Update device type if model changed
+            # Update device type if model changed (unless preserved)
             current_type_id = nb_device.device_type.id if nb_device.device_type else None
-            if nb_device_type and current_type_id != nb_device_type.id:
+            if (
+                not should_preserve_field(nb_device, "device_type")
+                and nb_device_type
+                and current_type_id != nb_device_type.id
+            ):
                 nb_device.device_type = nb_device_type.id
                 try:
                     nb_device.save()
                     logger.info(f"Updated device type for {device_name} to {device_model}")
                 except pynetbox.core.query.RequestError as e:
                     logger.warning(f"Failed to update device type for {device_name}: {e}")
-            # Update asset tag from device name (ID/AID suffix)
+            # Update asset tag from device name (ID/AID suffix) unless preserved
             asset_tag = extract_asset_tag(device_name)
-            if asset_tag and getattr(nb_device, 'asset_tag', None) != asset_tag:
+            if (
+                asset_tag
+                and not should_preserve_field(nb_device, "asset_tag")
+                and getattr(nb_device, 'asset_tag', None) != asset_tag
+            ):
                 nb_device.asset_tag = asset_tag
                 try:
                     nb_device.save()
@@ -1679,23 +1759,32 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                     logger.info(f"Added 'zabbix' tag to device {device_name}.")
 
             # Sync device state (ONLINE/OFFLINE -> active/offline)
-            try:
-                sync_device_state(nb, nb_device, device)
-            except Exception as e:
-                logger.warning(f"Failed to sync state for {device_name}: {e}")
+            if should_preserve_field(nb_device, "status"):
+                logger.debug(f"Skipping status sync for {device_name} (preserve flag set)")
+            else:
+                try:
+                    sync_device_state(nb, nb_device, device)
+                except Exception as e:
+                    logger.warning(f"Failed to sync state for {device_name}: {e}")
 
             # Sync custom fields (firmware, uptime, mac)
-            try:
-                sync_device_custom_fields(nb, nb_device, device)
-            except Exception as e:
-                logger.warning(f"Failed to sync custom fields for {device_name}: {e}")
+            if should_preserve_field(nb_device, "custom_fields"):
+                logger.debug(f"Skipping custom fields sync for {device_name} (preserve flag set)")
+            else:
+                try:
+                    sync_device_custom_fields(nb, nb_device, device)
+                except Exception as e:
+                    logger.warning(f"Failed to sync custom fields for {device_name}: {e}")
 
             # Sync physical interfaces from UniFi to NetBox
-            try:
-                api_style = getattr(unifi, "api_style", "legacy") or "legacy"
-                sync_device_interfaces(nb, nb_device, device, api_style, unifi=unifi, site_obj=unifi_site_obj)
-            except Exception as e:
-                logger.warning(f"Failed to sync interfaces for {device_name}: {e}")
+            if should_preserve_field(nb_device, "interfaces"):
+                logger.debug(f"Skipping interfaces sync for {device_name} (preserve flag set)")
+            else:
+                try:
+                    api_style = getattr(unifi, "api_style", "legacy") or "legacy"
+                    sync_device_interfaces(nb, nb_device, device, api_style, unifi=unifi, site_obj=unifi_site_obj)
+                except Exception as e:
+                    logger.warning(f"Failed to sync interfaces for {device_name}: {e}")
 
         # Add primary IP if available — skip routers/gateways (they manage their own IPs)
         role_key = infer_role_key_for_device(device)
