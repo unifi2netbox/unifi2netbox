@@ -83,6 +83,12 @@ _unifi_network_info = ipam_helpers._unifi_network_info         # site_id -> list
 _unifi_network_info_lock = ipam_helpers._unifi_network_info_lock
 _cleanup_serials_by_site = {}          # site_id -> set of UniFi serials (for cleanup)
 _cleanup_serials_lock = threading.Lock()
+# Global flat set of every UniFi serial seen across all controllers/sites in
+# the current sync run. Used by the stale-marking pass to decide whether a
+# NetBox device is still present in UniFi *anywhere*, regardless of which
+# NetBox site it currently sits on (Layer 1 preserves manual site moves, so
+# a device may legitimately live on a different site than its mapping target).
+_all_unifi_serials_global = set()
 _site_mapping_cache = {}
 _site_mapping_cache_lock = threading.Lock()
 
@@ -2028,6 +2034,7 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, t
             # Store serials for cleanup
             with _cleanup_serials_lock:
                 _cleanup_serials_by_site[nb_site.id] = site_serials
+                _all_unifi_serials_global.update(site_serials)
 
             with ThreadPoolExecutor(max_workers=MAX_DEVICE_THREADS) as executor:
                 futures = []
@@ -2090,14 +2097,18 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, t
                 except Exception as e:
                     logger.warning(f"Failed to sync uplink cables for site {site_display_name}: {e}")
 
-            # Mark stale devices (in NetBox but no longer in UniFi) as offline
+            # Mark stale devices (in NetBox but no longer in UniFi) as offline.
+            #
+            # The check uses the GLOBAL serial set across all controllers/sites,
+            # not a per-site one. Rationale: with global serial lookup + site
+            # preservation, a device may live on a NetBox site that differs
+            # from its UniFi mapping target. Marking such a device offline just
+            # because its serial isn't in the current site's UniFi payload would
+            # clobber legitimately relocated devices.
             if os.getenv("SYNC_STALE_CLEANUP", "true").strip().lower() in ("true", "1", "yes"):
                 try:
-                    unifi_serials = set()
-                    for d in devices:
-                        s = get_device_serial(d)
-                        if s:
-                            unifi_serials.add(s)
+                    with _cleanup_serials_lock:
+                        unifi_serials = set(_all_unifi_serials_global)
                     nb_devices_at_site = list(nb.dcim.devices.filter(site_id=nb_site.id, tenant_id=tenant.id))
                     for nb_dev in nb_devices_at_site:
                         if nb_dev.serial and nb_dev.serial not in unifi_serials:
@@ -2532,6 +2543,7 @@ if __name__ == "__main__":
         if run_count > 1:
             _device_type_specs_done.clear()
             _cleanup_serials_by_site.clear()
+            _all_unifi_serials_global.clear()
             _assigned_static_ips.clear()
             _unifi_dhcp_ranges.clear()
             _unifi_network_info.clear()
