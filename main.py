@@ -331,6 +331,37 @@ def get_device_mac(device: dict) -> str | None:
 def get_device_ip(device: dict) -> str | None:
     return device.get("ip") or device.get("ipAddress")
 
+
+def normalize_device_state(device: dict) -> str:
+    """
+    Normalize UniFi device state to an uppercase string label.
+
+    UniFi legacy / session-login API sends `state` as an int:
+        0 = disconnected/offline
+        1 = connected/online
+    UniFi OS / Integration API typically sends `status` as a string
+    ("connected", "disconnected", etc.). Some payloads (e.g. offline devices
+    in legacy mode) only provide the integer.
+
+    Returns one of: "CONNECTED", "DISCONNECTED", or whatever uppercase string
+    the API supplied (e.g. "PENDING"). Never raises.
+    """
+    state = device.get("state")
+    if state is None:
+        state = device.get("status")
+    if state is None:
+        return ""
+    if isinstance(state, bool):
+        # bool is a subclass of int — handle before int branch.
+        return "CONNECTED" if state else "DISCONNECTED"
+    if isinstance(state, int):
+        if state == 0:
+            return "DISCONNECTED"
+        if state == 1:
+            return "CONNECTED"
+        return str(state)
+    return str(state).upper()
+
 def get_device_serial(device: dict) -> str | None:
     """
     Determine what to put in NetBox's `serial` field.
@@ -385,6 +416,18 @@ def is_access_point_device(device: dict) -> bool:
             )
             for iface in interfaces
         )
+    # Fallback: detect APs by model prefix. UniFi legacy API does not always
+    # populate `is_access_point` (e.g. for offline devices the flag is absent).
+    # Known AP model families: UAP-*, U7* (excl. U7S* switches), U6* (excl.
+    # U6S* switches), BZ2*. Switches (USW*/US*) and routers (USG/UDM/UXG/UGW/UDR)
+    # never match this fallback.
+    model = str(device.get("model") or "").upper()
+    if not model:
+        return False
+    if model.startswith(("U7S", "U6S", "USW", "US", "USG", "UDM", "UXG", "UGW", "UDR", "UCK")):
+        return False
+    if model.startswith(("UAP", "U7", "U6", "BZ2")):
+        return True
     return False
 
 def ensure_custom_field(nb, name, cf_type="text", content_types=None, label=None):
@@ -461,7 +504,7 @@ def ensure_tag(nb, name, slug=None, color=None):
 
 def sync_device_state(nb, nb_device, device):
     """Sync UniFi device state to NetBox device status (active/offline)."""
-    state = (device.get("state") or device.get("status") or "").upper()
+    state = normalize_device_state(device)
     if state in ("ONLINE", "CONNECTED", "1"):
         desired = "active"
     elif state in ("OFFLINE", "DISCONNECTED", "0"):
@@ -536,7 +579,7 @@ def sync_uplink_cable(nb, nb_device, device, all_nb_devices_by_mac):
     device_name = get_device_name(device)
 
     # Check if device is offline — remove cables and skip
-    device_state = (device.get("state") or device.get("status") or "").upper()
+    device_state = normalize_device_state(device)
     if device_state in ("OFFLINE", "DISCONNECTED", "0"):
         # Remove all cables from this device's interfaces
         try:
@@ -1557,7 +1600,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
         device_serial = get_device_serial(device)
 
         # Skip offline/disconnected devices
-        device_state = (device.get("state") or device.get("status") or "").upper()
+        device_state = normalize_device_state(device)
         if device_state in ("OFFLINE", "DISCONNECTED", "0"):
             logger.debug(f"Skipping offline device {device_name}")
             return
