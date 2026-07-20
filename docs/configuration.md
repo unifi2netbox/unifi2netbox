@@ -68,6 +68,8 @@ If Integration API is unavailable, use local controller base URL + `UNIFI_USERNA
 | `NETBOX_SERIAL_MODE` | No | `mac` | `mac`, `unifi`, `id`, `none` |
 | `NETBOX_VRF_MODE` | No | `existing` | `none`, `existing`, `create` |
 | `NETBOX_DEFAULT_VRF` | No | empty | If set, use this VRF name for all imported IPs instead of site-based VRF names |
+| `NETBOX_DEVICE_TAGS` | No | empty | Comma-separated list of tags attached to every synced device. Empty by default — no implicit tag is added. Previous versions hardcoded `zabbix`. |
+| `UNIFI_MANUFACTURER_SLUG` | No | `ubiquiti` | NetBox manufacturer slug for UniFi devices. Installs created when this was hardcoded to the misspelled `ubiquity` are auto-detected via a legacy fallback. Set explicitly to silence the info log. |
 
 ### Device roles
 

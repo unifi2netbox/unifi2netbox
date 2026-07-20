@@ -119,7 +119,7 @@ class TestRunNetboxCleanup:
         ) as dev_types:
             main.run_netbox_cleanup(
                 nb=object(),
-                nb_ubiquity=object(),
+                nb_ubiquiti=object(),
                 tenant=object(),
                 netbox_sites_dict={"site-a": type("Site", (), {"id": 1, "name": "A"})()},
                 all_unifi_serials_by_site={1: {"ABC123"}},
@@ -145,7 +145,7 @@ class TestRunNetboxCleanup:
         ) as dev_types:
             main.run_netbox_cleanup(
                 nb="nb",
-                nb_ubiquity="ubiq",
+                nb_ubiquiti="ubiq",
                 tenant="tenant",
                 netbox_sites_dict={"site-7": site},
                 all_unifi_serials_by_site={7: {"SER1"}},
