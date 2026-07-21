@@ -140,6 +140,13 @@ Existing NetBox devices are matched **globally by serial** (not scoped to a
 site), and the script never auto-moves a device between sites — if you
 relocate a device in NetBox, the next sync keeps it where you put it.
 
+If a device exists at the target site with the same `name` but **no serial**
+(e.g. pre-created manually), the sync adopts it and fills in its serial
+instead of creating a duplicate. A same-name device that already carries a
+*different* serial is never adopted — that's treated as a different physical
+device, and the script falls back to creating with a `{name}_{serial}`
+suffix.
+
 The flags below additionally protect individual fields from being overwritten
 on every sync run. This is useful when an admin has manually edited a device
 in NetBox and wants those edits to survive subsequent syncs.
@@ -157,6 +164,29 @@ in NetBox and wants those edits to survive subsequent syncs.
 (they are only set when a device is first created); there are no flags for
 these fields.
 
+## Physical Replacement Policy
+
+When a UniFi device's name matches an existing NetBox record at the same site,
+but with a different non-empty serial that is NOT reported by UniFi anywhere
+(the old physical unit was replaced), the sync's behavior is controlled by
+`UNIFI_NAME_CONFLICT_POLICY`:
+
+| Value | Behavior |
+|---|---|
+| `replace` (default) | Adopt the existing record, overwrite `serial`, `device_type`, and UniFi custom fields. Rack, position, role, tenant, asset_tag, and comments are preserved. |
+| `new` | Never touch a record that already has a serial; create a new device with a suffixed name (e.g. `name_serial`). |
+
+The replacement branch fires only when all of the following hold:
+
+- the new UniFi serial is not yet present in NetBox (would otherwise hit Step 1),
+- exactly one same-name record exists at the target site,
+- that record's serial is non-empty and is NOT in the global UniFi serial set
+  seen across all controllers/sites in the current run (so a device that
+  merely moved to another UniFi site is left alone).
+
+Use `unifi-keep-serial` tag (or `unifi-keep-all`) on a specific NetBox device
+to opt it out of the replacement behavior.
+
 ### Per-device override tags
 
 For finer-grained control, attach one of these tags to a device in NetBox.
@@ -167,6 +197,7 @@ A tag takes precedence over the global `KEEP_EXISTING_*` flags.
 | `unifi-keep-name` | Preserve `name` on this device |
 | `unifi-keep-device-type` | Preserve `device_type` |
 | `unifi-keep-asset-tag` | Preserve `asset_tag` |
+| `unifi-keep-serial` | Preserve `serial` (block auto-fill of empty serial) |
 | `unifi-keep-status` | Preserve `status` |
 | `unifi-keep-interfaces` | Skip interface sync |
 | `unifi-keep-custom-fields` | Skip custom-field sync |

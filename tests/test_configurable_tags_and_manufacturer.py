@@ -149,12 +149,16 @@ class TestNoUbiquityTypoInBusinessLogic:
         # All such matches must be inside the legacy fallback block, which is
         # the only place where the old slug is intentionally referenced.
         assert matches, "Expected at least one 'ubiquity' literal in the legacy fallback"
+        # Locate the fallback block dynamically by its anchor comment so the
+        # test is robust to unrelated edits elsewhere in main.py.
+        anchor = src.find("UNIFI_MANUFACTURER_SLUG")
+        assert anchor != -1, "UNIFI_MANUFACTURER_SLUG anchor not found"
+        anchor_line = src.count("\n", 0, anchor) + 1
+        window_start = anchor_line - 5
+        window_end = anchor_line + 35
         for line_no, _ in matches:
-            # The fallback lives roughly between the 'UNIFI_MANUFACTURER_SLUG'
-            # declaration and the tenant lookup that follows it. We assert
-            # each match is within that window to prevent accidental reuse
-            # elsewhere in the file.
-            assert 2450 <= line_no <= 2480, (
+            assert window_start <= line_no <= window_end, (
                 f"'ubiquity' literal at line {line_no} is outside the legacy "
-                f"fallback block — likely a reintroduced typo."
+                f"fallback block (window {window_start}-{window_end}) — likely "
+                f"a reintroduced typo."
             )

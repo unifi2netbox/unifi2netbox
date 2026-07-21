@@ -16,6 +16,17 @@ All notable changes to this project are documented in this file.
 - UniFi session cache control:
   - `UNIFI_PERSIST_SESSION` (default: `true`)
 - Robust integer parsing helper for runtime env vars (used for sync interval and cleanup grace period).
+- Existing-device lookup now falls back to same-name + empty-serial at the target site, adopting the record and filling its serial instead of creating a duplicate. The `unifi-keep-serial` tag (and `unifi-keep-all`) opts a device out of the auto-fill.
+- New `UNIFI_NAME_CONFLICT_POLICY=replace|new` (default: `replace`) controls behavior when a UniFi device reuses a name that already exists in NetBox under a different stale serial (physical-replacement scenario). `replace` adopts the existing record and overwrites serial/device_type/custom fields; `new` creates a new device with a suffixed name.
+- Device-type creation now defaults all switches (role `LAN`) to `is_full_depth=false` to avoid spurious rack-occupancy conflicts when specs are missing. Hardcoded specs added for `USL24PB` and `USW-PRO-24` (compact switches).
+- IP-address sync now adopts orphan records (matching host under any mask, no tenant) and rebinds them to the current device, clearing stale `primary_ip4` references on previous owners.
+
+### Fixed
+- Devices that already exist in NetBox with an empty serial no longer cause duplicate creation (or a spurious `{name}_{serial}` variant) on the next sync. The existing record is now adopted and its serial is filled in.
+- Duplicate-IP errors during IP-address assignment no longer crash the device sync; the existing record is adopted, normalized to the current tenant/VRF, and rebound to the device's `vlan.1` interface.
+- `device_types.create` recovery now handles `already exists` / `constraint violated` messages in addition to the legacy Postgres duplicate-key text, and falls back to a `slug` lookup when `model` and `part_number` miss.
+- `devices.create` race-recovery now matches the NetBox 4.x `dcim_device_unique_name_site_tenant` constraint text (not just the legacy "Device name must be unique per site").
+- Device-type updates that fail with a rack/position conflict now attempt to relax `is_full_depth=false` on the target type (respecting explicit `True` specs) and retry, so device-type rotations on rack-mounted switches no longer fail.
 
 ### Changed
 - Runtime startup validation logs now use `logger.error(...)` for fail-fast config checks (instead of `logger.exception(...)` outside `except` blocks).
