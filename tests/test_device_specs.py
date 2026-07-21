@@ -1,5 +1,6 @@
 """Tests for community device specs integration."""
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 import pytest
 
 from main import (
@@ -178,3 +179,60 @@ class TestResolveDeviceSpecs:
         # UAP-AC-LITE is both a hardcoded part_number AND a community key
         result = _resolve_device_specs("UAP-AC-Lite")
         assert result is not None
+
+
+# ---------------------------------------------------------------------------
+#  is_full_depth default policy (switches default to non-full-depth)
+# ---------------------------------------------------------------------------
+
+class TestSwitchDepthDefault:
+    """Switch device-types must default to is_full_depth=False unless specs
+    explicitly override. This prevents rack-occupancy conflicts when a known
+    community spec is missing."""
+
+    def test_relax_returns_true_when_already_false(self):
+        import main
+        dt = SimpleNamespace(id=1, is_full_depth=False, save=MagicMock())
+        assert main._try_relax_device_type_depth(MagicMock(), dt, "USL24PB") is True
+        dt.save.assert_not_called()
+
+    def test_relax_flips_to_false_when_specs_silent(self):
+        import main
+        dt = SimpleNamespace(id=1, is_full_depth=True, save=MagicMock())
+        with patch.object(main, "_resolve_device_specs", return_value={}):
+            result = main._try_relax_device_type_depth(MagicMock(), dt, "UNKNOWN-MODEL")
+        assert result is True
+        assert dt.is_full_depth is False
+        dt.save.assert_called_once()
+
+    def test_relax_refuses_when_specs_say_full_depth(self):
+        import main
+        dt = SimpleNamespace(id=1, is_full_depth=True, save=MagicMock())
+        with patch.object(main, "_resolve_device_specs", return_value={"is_full_depth": True}):
+            result = main._try_relax_device_type_depth(MagicMock(), dt, "US-24")
+        assert result is False
+        assert dt.is_full_depth is True  # unchanged
+        dt.save.assert_not_called()
+
+    def test_relax_handles_none_device_type(self):
+        import main
+        assert main._try_relax_device_type_depth(MagicMock(), None, "X") is False
+
+    def test_relax_logs_and_returns_false_on_save_error(self):
+        import main
+        dt = SimpleNamespace(id=1, is_full_depth=True, save=MagicMock(side_effect=Exception("save failed")))
+        with patch.object(main, "_resolve_device_specs", return_value={}):
+            result = main._try_relax_device_type_depth(MagicMock(), dt, "X")
+        assert result is False
+
+
+class TestHardcodedSwitchDepth:
+    """Compact switches hardcoded with is_full_depth=False."""
+
+    def test_usl24pb_is_full_depth_false(self):
+        from unifi.model_specs import UNIFI_MODEL_SPECS
+        assert UNIFI_MODEL_SPECS["USL24PB"]["is_full_depth"] is False
+
+    def test_usw_pro_24_is_full_depth_false(self):
+        from unifi.model_specs import UNIFI_MODEL_SPECS
+        assert UNIFI_MODEL_SPECS["USW-PRO-24"]["is_full_depth"] is False

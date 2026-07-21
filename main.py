@@ -24,11 +24,14 @@ from sync.ipam import (
     set_unifi_device_static_ip,
 )
 from sync.runtime_config import (
+    NAME_CONFLICT_NEW,  # noqa: F401 (re-exported for tests)
+    NAME_CONFLICT_REPLACE,
     _netbox_verify_ssl,
     _parse_env_bool,
     _read_env_int,
     _sync_interval_seconds,
     load_keep_existing_settings,
+    load_name_conflict_policy,
     load_runtime_config,
 )
 from sync.runtime_config import _unifi_verify_ssl  # noqa: F401
@@ -1392,6 +1395,42 @@ def _lookup_community_specs(part_number=None, model=None):
     return None
 
 
+def _try_relax_device_type_depth(nb, nb_device_type, model):
+    """
+    Try to flip a device-type's is_full_depth to False in response to a rack /
+    position conflict on a device update.
+
+    Returns True if the type was successfully set to non-full-depth (or was
+    already non-full-depth), False otherwise. Specs override the policy: if
+    `_resolve_device_specs` explicitly states `is_full_depth=True`, the type is
+    left alone (the operator intentionally marked it full-depth).
+    """
+    if nb_device_type is None:
+        return False
+    if getattr(nb_device_type, "is_full_depth", None) is False:
+        return True  # already relaxed
+
+    specs = _resolve_device_specs(model) or {}
+    # Respect an explicit full-depth spec; do not silently downgrade.
+    if specs.get("is_full_depth") is True:
+        logger.debug(
+            f"Not relaxing is_full_depth for {model} — specs explicitly say True."
+        )
+        return False
+
+    try:
+        nb_device_type.is_full_depth = False
+        nb_device_type.save()
+        logger.info(
+            f"Relaxed device type '{model}' (ID {nb_device_type.id}) to "
+            f"is_full_depth=False to resolve rack conflict."
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Could not relax is_full_depth for device type {model}: {e}")
+        return False
+
+
 def _resolve_device_specs(model):
     """Resolve full device specs by merging UNIFI_MODEL_SPECS with community library.
 
@@ -1605,6 +1644,249 @@ def _ensure_device_type_specs_inner(nb, nb_device_type, model, specs):
         _sync_templates(nb, nb_device_type, model, nb.dcim.power_port_templates, expected_power, "power-port")
 
 
+def _device_serial_is_empty(nb_device) -> bool:
+    """Return True if a NetBox device has no usable serial (None or whitespace)."""
+    if nb_device is None:
+        return True
+    return _device_serial_is_empty_str(getattr(nb_device, "serial", None))
+
+
+def _device_serial_is_empty_str(serial) -> bool:
+    """Return True if a raw serial value is None or whitespace."""
+    if serial is None:
+        return True
+    return not str(serial).strip()
+
+
+def _safe_snapshot_global_serials() -> set:
+    """Return a snapshot copy of `_all_unifi_serials_global` under its lock."""
+    with _cleanup_serials_lock:
+        return set(_all_unifi_serials_global)
+
+
+def find_existing_device(nb, device_serial, device_name, site):
+    """
+    Find an existing NetBox device that corresponds to a UniFi device.
+
+    Strategy (in order):
+      1. Global lookup by serial — primary path so devices that were manually
+         moved to a different NetBox site are still found (Layer 1 regression).
+      2. Fallback by name within the target site, restricted to records with
+         an *empty* serial. This recovers the case where a device already
+         exists in NetBox without a serial; instead of creating a duplicate
+         we adopt the existing record and fill its serial in later.
+      3. Replacement fallback (only when UNIFI_NAME_CONFLICT_POLICY=replace):
+         same-name device at the target site whose serial is *stale* — i.e.
+         not present in `_all_unifi_serials_global`. This is the "physical
+         device was replaced" case: the same name slot is reused by a new
+         hardware unit. The existing record is adopted and its serial (plus
+         device_type and custom fields) overwritten in the caller.
+
+    Returns the matched NetBox device, or None.
+    """
+    # Step 1: serial lookup (global, deliberately not site-bound).
+    if device_serial:
+        existing_devices = list(nb.dcim.devices.filter(serial=device_serial))
+        if existing_devices:
+            if len(existing_devices) > 1:
+                logger.warning(
+                    f"Multiple NetBox devices share serial {device_serial} "
+                    f"(found {len(existing_devices)}). Using first: {existing_devices[0].name}."
+                )
+            return existing_devices[0]
+
+    # Step 2: name fallback within the target site — only adopt records with
+    # empty serial, to avoid hijacking a same-named device that belongs to a
+    # different physical device.
+    if not device_name or site is None:
+        return None
+    site_id = getattr(site, "id", None)
+    if site_id is None:
+        return None
+    try:
+        candidates = list(nb.dcim.devices.filter(name=device_name, site_id=site_id))
+    except Exception as e:
+        logger.debug(
+            f"Name-based fallback lookup failed for '{device_name}' at site {site_id}: {e}"
+        )
+        return None
+
+    empty_serial_matches = [d for d in candidates if _device_serial_is_empty(d)]
+    if empty_serial_matches:
+        if len(empty_serial_matches) > 1:
+            logger.warning(
+                f"Multiple NetBox devices at site {site_id} share name '{device_name}' "
+                f"with empty serial (found {len(empty_serial_matches)}). "
+                f"Using first: {empty_serial_matches[0].name}."
+            )
+        adopted = empty_serial_matches[0]
+        logger.info(
+            f"Adopting existing NetBox device '{getattr(adopted, 'name', device_name)}' "
+            f"(ID {getattr(adopted, 'id', '?')}) with empty serial for UniFi device '{device_name}'."
+        )
+        return adopted
+
+    # Step 3: replacement fallback. A same-name device exists with a different
+    # non-empty serial. Treat it as a physical replacement only when:
+    #   - the new serial is not in NetBox yet (otherwise it's a rename-case
+    #     handled by Step 1 on subsequent runs),
+    #   - the old serial is no longer reported by any UniFi controller/site
+    #     (so we don't hijack a device that simply moved to another site),
+    #   - policy allows it.
+    if load_name_conflict_policy() != NAME_CONFLICT_REPLACE:
+        return None
+    if not device_serial:
+        return None
+    with _cleanup_serials_lock:
+        known_unifi_serials = set(_all_unifi_serials_global)
+    replacement_matches = []
+    for cand in candidates:
+        cand_serial = getattr(cand, "serial", None)
+        if not cand_serial:
+            continue  # already covered by Step 2
+        cand_serial_norm = str(cand_serial).strip()
+        if cand_serial_norm == device_serial:
+            continue  # should have hit Step 1; defensive
+        if cand_serial_norm in known_unifi_serials:
+            # Old serial still seen in UniFi — not a replacement.
+            continue
+        replacement_matches.append(cand)
+
+    if not replacement_matches:
+        return None
+    if len(replacement_matches) > 1:
+        logger.warning(
+            f"Multiple stale same-name records at site {site_id} for '{device_name}' "
+            f"(found {len(replacement_matches)}); not adopting to avoid ambiguity."
+        )
+        return None
+    adopted = replacement_matches[0]
+    logger.info(
+        f"Adopting existing NetBox device '{getattr(adopted, 'name', device_name)}' "
+        f"(ID {getattr(adopted, 'id', '?')}, stale serial {getattr(adopted, 'serial', '?')}) "
+        f"as replacement for UniFi device '{device_name}' (new serial {device_serial})."
+    )
+    return adopted
+
+
+def _find_ip_by_host(nb, host_ip, tenant=None, vrf=None, prefer_interface=None):
+    """
+    Look up an existing IPAddress by host (without mask and without tenant/vrf
+    binding).
+
+    NetBox stores the same host under a specific prefix length (e.g. /24); the
+    sync derives the mask from a parent prefix which may use a different length
+    (e.g. /16). A bare-host lookup returns all records for that host regardless
+    of mask, letting us adopt the existing record instead of failing the sync.
+
+    The lookup deliberately ignores tenant/vrf: orphaned records left over from
+    earlier runs or created by other tools often have no tenant set, while the
+    sync's create path always stamps the current tenant. Adopting such an
+    orphan and rebinding tenant+interface is preferable to crashing the device
+    sync over a "Duplicate IP" error.
+
+    When ``prefer_interface`` is supplied, an IP already bound to that interface
+    is preferred over other candidates. Returns the matched IPAddress or None.
+    """
+    if not host_ip:
+        return None
+    try:
+        candidates = list(nb.ipam.ip_addresses.filter(address=host_ip))
+    except Exception as e:
+        logger.debug(f"Bare-IP fallback lookup failed for {host_ip}: {e}")
+        return None
+    if not candidates:
+        return None
+    if prefer_interface is not None:
+        preferred_id = getattr(prefer_interface, "id", prefer_interface)
+        for cand in candidates:
+            if getattr(cand, "assigned_object_id", None) == preferred_id:
+                return cand
+    if len(candidates) > 1:
+        logger.warning(
+            f"Multiple IP records found for host {host_ip} "
+            f"(masks: {[str(getattr(c, 'address', '?')) for c in candidates]}); "
+            f"using ID {getattr(candidates[0], 'id', '?')}."
+        )
+    return candidates[0]
+
+
+def _normalize_adopted_ip(nb_ip, tenant, vrf):
+    """
+    Stamp an adopted IPAddress with the sync's tenant/vrf if they differ.
+
+    Orphaned records (typically created by other tools) often have empty
+    tenant/vrf. The sync's create path always sets them, so we normalize the
+    adopted record to match. Errors are logged but non-fatal — the IP is
+    already adopted and the device sync can proceed.
+    """
+    if nb_ip is None:
+        return
+    changed = False
+    desired_tenant_id = getattr(tenant, "id", tenant) if tenant is not None else None
+    if desired_tenant_id is not None and getattr(nb_ip, "tenant_id", None) != desired_tenant_id:
+        nb_ip.tenant = desired_tenant_id
+        changed = True
+    if vrf is not None:
+        desired_vrf_id = getattr(vrf, "id", vrf)
+        if getattr(nb_ip, "vrf_id", None) != desired_vrf_id:
+            nb_ip.vrf = desired_vrf_id
+            changed = True
+    if changed:
+        try:
+            nb_ip.save()
+            logger.debug(
+                f"Normalized tenant/vrf on adopted IP {nb_ip.address} (ID {nb_ip.id})."
+            )
+        except Exception as e:
+            logger.warning(f"Failed to normalize tenant/vrf on IP {nb_ip.address}: {e}")
+
+
+def _clear_primary_ip_owner(nb, nb_ip, target_interface, target_device, device_name):
+    """
+    Pre-clear primary_ip4 on whatever device currently owns ``nb_ip``.
+
+    NetBox refuses to reassign an IPAddress to a different interface while it
+    is referenced as some device's primary_ip4. UniFi authoritatively maps
+    each IP to a single device, so when the IP moves we follow suit: drop the
+    stale primary_ip4 reference on the previous owner, then the actual rebind
+    (performed by the caller) will succeed.
+
+    No-op when the IP is unassigned, already bound to the target interface,
+    or owned by the target device itself. Errors are logged at debug level —
+    the caller will surface a rebind failure if one still occurs.
+    """
+    current_obj_id = getattr(nb_ip, "assigned_object_id", None)
+    if current_obj_id is None or current_obj_id == getattr(target_interface, "id", None):
+        return
+    try:
+        current_iface = nb.dcim.interfaces.get(current_obj_id)
+        if current_iface is None:
+            return
+        owner_ref = getattr(current_iface, "device", None)
+        owner_id = getattr(owner_ref, "id", None)
+        if owner_id is None or owner_id == getattr(target_device, "id", None):
+            return
+        owner = nb.dcim.devices.get(owner_id)
+        if owner is None:
+            return
+        # primary_ip4 may be a nested Record or None; compare by id.
+        current_primary = getattr(owner, "primary_ip4", None)
+        current_primary_id = getattr(current_primary, "id", None) or current_primary
+        if current_primary_id != getattr(nb_ip, "id", None):
+            return
+        owner.primary_ip4 = None
+        owner.save()
+        logger.info(
+            f"Cleared primary_ip4 on device '{owner.name}' (was {nb_ip.address}) "
+            f"to enable reassignment to {device_name}."
+        )
+    except Exception as e:
+        logger.debug(
+            f"Could not pre-clear primary_ip4 owner for {nb_ip.address}: {e}"
+        )
+
+
 def process_device(unifi, nb, site, device, nb_ubiquiti, tenant, unifi_device_ips=None, unifi_site_obj=None):
     """Process a device and add it to NetBox."""
     try:
@@ -1649,6 +1931,12 @@ def process_device(unifi, nb, site, device, nb_ubiquiti, tenant, unifi_device_ip
                 "model": device_model,
                 "slug": (specs or {}).get("slug") or slugify(f'{nb_ubiquiti.name}-{device_model}'),
             }
+            # Default all switches to non-full-depth. NetBox's own default is
+            # True, but most UniFi switches that share racks with other gear
+            # are compact; defaulting to False avoids spurious rack-occupancy
+            # conflicts. Specs / community library override this when available.
+            if selected_role_key == "LAN":
+                create_data["is_full_depth"] = False
             if specs:
                 if specs.get("part_number"):
                     create_data["part_number"] = specs["part_number"]
@@ -1670,38 +1958,54 @@ def process_device(unifi, nb, site, device, nb_ubiquiti, tenant, unifi_device_ip
                     logger.info(f"Device type {device_model} with ID {nb_device_type.id} successfully added to NetBox.")
             except pynetbox.core.query.RequestError as e:
                 error_message = str(e).lower()
-                if "duplicate key value violates unique constraint" in error_message:
-                    # Race condition guard: another worker may have created the same type just before us.
+                # Recovery path covers several constraint flavors across NetBox
+                # versions / DB backends: "duplicate key value violates unique
+                # constraint" (Postgres), "with this slug already exists" /
+                # "with this model already exists" (DRF validation), and the
+                # generic "constraint ... is violated".
+                is_constraint = (
+                    "duplicate key value violates unique constraint" in error_message
+                    or "already exists" in error_message
+                    or "constraint" in error_message and "violated" in error_message
+                )
+                if is_constraint:
+                    # Race condition guard: another worker may have created the
+                    # same type just before us, OR the type may exist under a
+                    # different field (slug/part_number). Try every key.
                     nb_device_type = nb.dcim.device_types.get(model=device_model, manufacturer_id=nb_ubiquiti.id)
                     if not nb_device_type and create_data.get("part_number"):
                         nb_device_type = nb.dcim.device_types.get(
                             part_number=create_data["part_number"], manufacturer_id=nb_ubiquiti.id
                         )
+                    if not nb_device_type and create_data.get("slug"):
+                        try:
+                            slug_matches = list(nb.dcim.device_types.filter(slug=create_data["slug"]))
+                            if slug_matches:
+                                nb_device_type = slug_matches[0]
+                        except Exception:
+                            pass
                     if nb_device_type:
                         logger.debug(
                             f"Device type {device_model} already exists after duplicate create error; reusing ID {nb_device_type.id}."
                         )
                     else:
-                        logger.error("Failed to recover duplicate device type after create conflict")
+                        logger.error(
+                            f"Failed to create device type {device_model} (constraint conflict, no match found): {e}"
+                        )
                         return
                 else:
-                    logger.error("Failed to create device type in NetBox")
+                    logger.error(f"Failed to create device type {device_model} in NetBox: {e}")
                     return
         # Ensure device type has correct specs (ports, PoE, part number, etc.)
         ensure_device_type_specs(nb, nb_device_type, device_model)
 
-        # Check for existing device — global lookup by serial (not site-bound).
-        # Site/tenant/role are never overwritten on existing devices; if a device
-        # was manually moved to a different site it will still be found here and
-        # kept at its current site.
+        # Check for existing device — primary lookup is global by serial (not
+        # site-bound); site/tenant/role are never overwritten on existing
+        # devices. If a device exists at the target site with the same name
+        # but no serial, we adopt it and fill in its serial below instead of
+        # creating a duplicate. See find_existing_device() for details.
         logger.debug(f"Checking if device already exists: {device_name} (serial: {device_serial})")
-        existing_devices = list(nb.dcim.devices.filter(serial=device_serial))
-        if len(existing_devices) > 1:
-            logger.warning(
-                f"Multiple NetBox devices share serial {device_serial} "
-                f"(found {len(existing_devices)}). Using first: {existing_devices[0].name}."
-            )
-        nb_device = existing_devices[0] if existing_devices else None
+        nb_device = find_existing_device(nb, device_serial, device_name, site)
         if nb_device:
             nb_site = getattr(nb_device, "site", None)
             nb_site_id = getattr(nb_site, "id", None) if nb_site else None
@@ -1713,6 +2017,40 @@ def process_device(unifi, nb, site, device, nb_ubiquiti, tenant, unifi_device_ip
                     f"Keeping current site; not moving."
                 )
             logger.info(f"Device {device_name} with serial {device_serial} already exists. Checking IP...")
+            # Serial reconcile. Two cases share this path:
+            #   - Adoption with empty serial: fill it in.
+            #   - Replacement (UNIFI_NAME_CONFLICT_POLICY=replace): overwrite a
+            #     stale serial that's no longer reported by UniFi.
+            # Both are gated by the same preserve-tag/env rules and never run
+            # when the existing serial is current (matches UniFi).
+            current_serial = getattr(nb_device, "serial", None)
+            serial_is_stale = (
+                bool(current_serial)
+                and str(current_serial).strip() != device_serial
+                and str(current_serial).strip() not in _safe_snapshot_global_serials()
+            )
+            if (
+                device_serial
+                and not should_preserve_field(nb_device, "serial")
+                and current_serial != device_serial
+                and (_device_serial_is_empty(nb_device) or serial_is_stale)
+            ):
+                old_serial = current_serial
+                nb_device.serial = device_serial
+                try:
+                    nb_device.save()
+                    if _device_serial_is_empty_str(old_serial):
+                        logger.info(
+                            f"Filled empty serial on existing device {nb_device.name} -> {device_serial}"
+                        )
+                    else:
+                        logger.info(
+                            f"Replaced stale serial on existing device {nb_device.name}: "
+                            f"{old_serial} -> {device_serial}"
+                        )
+                except pynetbox.core.query.RequestError as e:
+                    logger.warning(f"Failed to set serial on existing device {nb_device.name}: {e}")
+                    nb_device.serial = old_serial  # Revert on failure
             # Update device name if changed in UniFi (unless preserved)
             if not should_preserve_field(nb_device, "name") and nb_device.name != device_name:
                 old_name = nb_device.name
@@ -1735,7 +2073,31 @@ def process_device(unifi, nb, site, device, nb_ubiquiti, tenant, unifi_device_ip
                     nb_device.save()
                     logger.info(f"Updated device type for {device_name} to {device_model}")
                 except pynetbox.core.query.RequestError as e:
-                    logger.warning(f"Failed to update device type for {device_name}: {e}")
+                    err_text = str(e)
+                    # Rack/position conflict typically stems from the target
+                    # device-type having is_full_depth=True while a neighbor at
+                    # the same rack position is non-full-depth (or vice versa).
+                    # UniFi switches are compact by policy; flip the type to
+                    # non-full-depth (unless specs override) and retry once.
+                    is_rack_conflict = (
+                        "position" in err_text.lower()
+                        or "rack" in err_text.lower()
+                        or "is_full_depth" in err_text.lower()
+                    )
+                    if is_rack_conflict and _try_relax_device_type_depth(nb, nb_device_type, device_model):
+                        try:
+                            nb_device.save()
+                            logger.info(
+                                f"Updated device type for {device_name} to {device_model} "
+                                f"(after relaxing is_full_depth=False)"
+                            )
+                        except pynetbox.core.query.RequestError as e2:
+                            logger.warning(
+                                f"Failed to update device type for {device_name} even after "
+                                f"relaxing is_full_depth: {e2}"
+                            )
+                    else:
+                        logger.warning(f"Failed to update device type for {device_name}: {e}")
             # Update asset tag from device name (ID/AID suffix) unless preserved
             asset_tag = extract_asset_tag(device_name)
             if (
@@ -1790,17 +2152,52 @@ def process_device(unifi, nb, site, device, nb_ubiquiti, tenant, unifi_device_ip
                     logger.info(f"Device {device_name} serial {device_serial} with ID {nb_device.id} successfully added to NetBox.")
             except pynetbox.core.query.RequestError as e:
                 error_message = str(e)
-                if "Device name must be unique per site" in error_message:
-                    logger.warning(f"Device name {device_name} already exists at site {site}. "
-                                   f"Trying with name {device_name}_{device_serial}.")
-                    try:
-                        device_data['name'] = f"{device_name}_{device_serial}"
-                        nb_device = nb.dcim.devices.create(device_data)
-                        if nb_device:
-                            logger.info(f"Device {device_name} with ID {nb_device.id} successfully added to NetBox.")
-                    except pynetbox.core.query.RequestError as e2:
-                        logger.exception(f"Failed to create device {device_name} serial {device_serial} at site {site}: {e2}")
-                        return
+                # Match both the legacy "Device name must be unique per site"
+                # text and the NetBox 4.x constraint-violation form. The latter
+                # fires for the (name, site, tenant) uniqueness constraint.
+                is_name_conflict = (
+                    "Device name must be unique per site" in error_message
+                    or "dcim_device_unique_name_site_tenant" in error_message
+                    or ("name" in error_message.lower() and "unique" in error_message.lower())
+                )
+                if is_name_conflict:
+                    # Race condition: another thread/external process created or
+                    # adopted a device with this name at the same site between
+                    # our lookup and create. Retry the lookup — if a same-name
+                    # device with empty serial now exists, adopt it and fill in
+                    # the serial instead of spawning a suffixed duplicate.
+                    recovered = find_existing_device(nb, device_serial, device_name, site)
+                    if recovered and _device_serial_is_empty(recovered):
+                        logger.info(
+                            f"Recovered race for {device_name}: adopting existing device "
+                            f"ID {getattr(recovered, 'id', '?')} after name-conflict."
+                        )
+                        nb_device = recovered
+                        if (
+                            device_serial
+                            and not should_preserve_field(nb_device, "serial")
+                            and getattr(nb_device, "serial", None) != device_serial
+                        ):
+                            nb_device.serial = device_serial
+                            try:
+                                nb_device.save()
+                                logger.info(f"Filled empty serial on recovered device {nb_device.name} -> {device_serial}")
+                            except pynetbox.core.query.RequestError as save_err:
+                                logger.warning(f"Failed to set serial on recovered device {nb_device.name}: {save_err}")
+                                nb_device.serial = None
+                    else:
+                        # Genuine name collision with a different physical
+                        # device — fall back to a suffixed name.
+                        logger.warning(f"Device name {device_name} already exists at site {site}. "
+                                       f"Trying with name {device_name}_{device_serial}.")
+                        try:
+                            device_data['name'] = f"{device_name}_{device_serial}"
+                            nb_device = nb.dcim.devices.create(device_data)
+                            if nb_device:
+                                logger.info(f"Device {device_name} with ID {nb_device.id} successfully added to NetBox.")
+                        except pynetbox.core.query.RequestError as e2:
+                            logger.exception(f"Failed to create device {device_name} serial {device_serial} at site {site}: {e2}")
+                            return
                 else:
                     logger.exception(f"Failed to create device {device_name} serial {device_serial} at site {site}: {e}")
                     return
@@ -1968,6 +2365,17 @@ def process_device(unifi, nb, site, device, nb_ubiquiti, tenant, unifi_device_ip
             if vrf:
                 ip_get_filters["vrf_id"] = vrf.id
             nb_ip = nb.ipam.ip_addresses.get(**ip_get_filters)
+
+            # Fallback: look up by host IP without mask. The same host may be
+            # stored under a different prefix length (e.g. /24 vs /16); NetBox
+            # treats these as duplicates in the global table and would reject
+            # our create. We adopt the existing record and rebind it to this
+            # device's vlan.1 interface instead.
+            if not nb_ip:
+                nb_ip = _find_ip_by_host(nb, device_ip, tenant, vrf, interface)
+                if nb_ip:
+                    _normalize_adopted_ip(nb_ip, tenant, vrf)
+
             if not nb_ip:
                 try:
                     ip_payload = {
@@ -1983,12 +2391,50 @@ def process_device(unifi, nb, site, device, nb_ubiquiti, tenant, unifi_device_ip
                     if nb_ip:
                         logger.info(f"IP address {ip} with ID {nb_ip.id} successfully added to NetBox.")
                 except pynetbox.core.query.RequestError as e:
-                    logger.exception(f"Failed to create IP address {ip} for device {device_name} at site {site}: {e}")
-                    return
+                    # Race / mask-mismatch: another record with the same host
+                    # under a different mask appeared between lookup and create.
+                    # Try one more adoption pass before giving up.
+                    if "Duplicate IP" in str(e):
+                        nb_ip = _find_ip_by_host(nb, device_ip, tenant, vrf, interface)
+                        if nb_ip:
+                            _normalize_adopted_ip(nb_ip, tenant, vrf)
+                            logger.info(
+                                f"Adopted existing IP {nb_ip.address} (ID {nb_ip.id}) "
+                                f"after duplicate-create conflict for {device_name}."
+                            )
+                        else:
+                            logger.exception(f"Failed to create IP address {ip} for device {device_name} at site {site}: {e}")
+                            return
+                    else:
+                        logger.exception(f"Failed to create IP address {ip} for device {device_name} at site {site}: {e}")
+                        return
+            elif nb_ip:
+                # Rebind the adopted IP to this device's vlan.1 interface if it
+                # is currently unassigned or bound elsewhere.
+                current_obj_id = getattr(nb_ip, "assigned_object_id", None)
+                if current_obj_id != interface.id:
+                    # NetBox refuses to reassign an IP that is currently
+                    # another device's primary_ip4. Pre-clear that reference
+                    # so the rebind can succeed; the IP is moving to this
+                    # device anyway (UniFi authoritatively maps IP -> device).
+                    _clear_primary_ip_owner(nb, nb_ip, interface, nb_device, device_name)
+                    try:
+                        nb_ip.assigned_object_id = interface.id
+                        nb_ip.assigned_object_type = "dcim.interface"
+                        nb_ip.save()
+                        logger.info(
+                            f"Rebound existing IP {nb_ip.address} (ID {nb_ip.id}) "
+                            f"to interface vlan.1 on {device_name}."
+                        )
+                    except pynetbox.core.query.RequestError as e:
+                        logger.warning(
+                            f"Failed to rebind IP {nb_ip.address} to interface on {device_name}: {e}"
+                        )
+                        return
             if nb_ip:
                 nb_device.primary_ip4 = nb_ip.id
                 nb_device.save()
-                logger.info(f"Device {device_name} primary IP set to {ip}.")
+                logger.info(f"Device {device_name} primary IP set to {nb_ip.address}.")
 
     except Exception as e:
         logger.exception(f"Failed to process device {get_device_name(device)} at site {site}: {e}")

@@ -28,7 +28,7 @@ Exception: when DHCP-to-static conversion is enabled and triggered, the tool upd
 | Cables | Syncs uplink cable relationships |
 | IP behavior | Imports/updates primary IPs in NetBox; optional DHCP->static conversion can write static IP settings back to UniFi |
 | Device types | Enriches models with interface/console/power templates |
-| Manual overrides | Existing devices are matched by serial globally; site is never auto-moved. Per-field preservation via `KEEP_EXISTING_*` env or `unifi-keep-*` tags |
+| Manual overrides | Existing devices are matched by serial globally (with fallback to same-name + empty-serial at the target site); site is never auto-moved. Per-field preservation via `KEEP_EXISTING_*` env or `unifi-keep-*` tags |
 
 ## Architecture
 

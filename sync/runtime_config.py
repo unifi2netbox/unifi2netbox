@@ -176,6 +176,37 @@ def _load_roles_from_env():
     return roles or None
 
 
+# ---------------------------------------------------------------------------
+#  Name-conflict policy (replacement vs. new device)
+# ---------------------------------------------------------------------------
+# Controls what happens when a UniFi device's name matches an existing NetBox
+# record at the same site, but with a different non-empty serial that is NOT
+# reported by UniFi anywhere (i.e. the old physical device was replaced).
+#
+#   "replace" (default): adopt the existing record, overwrite serial + device
+#                        type + UniFi custom fields. Preserves rack, position,
+#                        role, tenant, asset_tag, comments.
+#   "new":               never adopt a record that already has a serial;
+#                        fall back to creating a new device with a suffixed
+#                        name (e.g. `name_serial`).
+# ---------------------------------------------------------------------------
+NAME_CONFLICT_REPLACE = "replace"
+NAME_CONFLICT_NEW = "new"
+_NAME_CONFLICT_VALUES = {NAME_CONFLICT_REPLACE, NAME_CONFLICT_NEW}
+
+
+def load_name_conflict_policy() -> str:
+    """Return the configured name-conflict policy (validated)."""
+    raw = (os.getenv("UNIFI_NAME_CONFLICT_POLICY") or NAME_CONFLICT_REPLACE).strip().lower()
+    if raw not in _NAME_CONFLICT_VALUES:
+        logger.warning(
+            f"Invalid UNIFI_NAME_CONFLICT_POLICY='{raw}', expected one of "
+            f"{sorted(_NAME_CONFLICT_VALUES)}. Using default '{NAME_CONFLICT_REPLACE}'."
+        )
+        return NAME_CONFLICT_REPLACE
+    return raw
+
+
 def load_config(config_path=None):
     """
     Backward-compatible no-op.
