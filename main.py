@@ -2568,7 +2568,9 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquiti, t
                 try:
                     with _cleanup_serials_lock:
                         unifi_serials = set(_all_unifi_serials_global)
-                    nb_devices_at_site = list(nb.dcim.devices.filter(site_id=nb_site.id, tenant_id=tenant.id))
+                    nb_devices_at_site = list(nb.dcim.devices.filter(
+                        site_id=nb_site.id, tenant_id=tenant.id, manufacturer_id=nb_ubiquiti.id
+                    ))
                     for nb_dev in nb_devices_at_site:
                         if nb_dev.serial and nb_dev.serial not in unifi_serials:
                             current_status = nb_dev.status.value if hasattr(nb_dev.status, 'value') else str(nb_dev.status)
@@ -2674,14 +2676,16 @@ def _cleanup_stale_days() -> int:
     return _read_env_int("CLEANUP_STALE_DAYS", default=30, minimum=0)
 
 
-def cleanup_stale_devices(nb, nb_site, tenant, unifi_serials):
+def cleanup_stale_devices(nb, nb_site, tenant, unifi_serials, nb_ubiquiti):
     """Delete devices at a site that are no longer present in UniFi.
 
     Only deletes devices that have been offline for longer than CLEANUP_STALE_DAYS.
     When CLEANUP_STALE_DAYS=0, all stale devices are deleted immediately.
     """
     grace_days = _cleanup_stale_days()
-    nb_devices = list(nb.dcim.devices.filter(site_id=nb_site.id, tenant_id=tenant.id))
+    nb_devices = list(nb.dcim.devices.filter(
+        site_id=nb_site.id, tenant_id=tenant.id, manufacturer_id=nb_ubiquiti.id
+    ))
     deleted = 0
     for dev in nb_devices:
         serial = str(dev.serial or "").upper().replace(":", "")
@@ -2722,9 +2726,11 @@ def cleanup_stale_devices(nb, nb_site, tenant, unifi_serials):
     return deleted
 
 
-def cleanup_orphan_interfaces(nb, nb_site, tenant):
+def cleanup_orphan_interfaces(nb, nb_site, tenant, nb_ubiquiti):
     """Delete garbage interfaces (names containing '?') at a site."""
-    nb_devices = list(nb.dcim.devices.filter(site_id=nb_site.id, tenant_id=tenant.id))
+    nb_devices = list(nb.dcim.devices.filter(
+        site_id=nb_site.id, tenant_id=tenant.id, manufacturer_id=nb_ubiquiti.id
+    ))
     deleted = 0
     for dev in nb_devices:
         ifaces = list(nb.dcim.interfaces.filter(device_id=dev.id))
@@ -2820,11 +2826,11 @@ def run_netbox_cleanup(nb, nb_ubiquiti, tenant, netbox_sites_dict, all_unifi_ser
     for site_name, nb_site in netbox_sites_dict.items():
         site_serials = all_unifi_serials_by_site.get(nb_site.id, set())
         try:
-            cleanup_stale_devices(nb, nb_site, tenant, site_serials)
+            cleanup_stale_devices(nb, nb_site, tenant, site_serials, nb_ubiquiti)
         except Exception as e:
             logger.warning(f"Cleanup error (stale devices) at site {site_name}: {e}")
         try:
-            cleanup_orphan_interfaces(nb, nb_site, tenant)
+            cleanup_orphan_interfaces(nb, nb_site, tenant, nb_ubiquiti)
         except Exception as e:
             logger.warning(f"Cleanup error (orphan interfaces) at site {site_name}: {e}")
         try:
@@ -2909,7 +2915,11 @@ if __name__ == "__main__":
     session.verify = _netbox_verify_ssl()
 
     logger.debug(f"Initializing NetBox API connection to: {netbox_url}")
-    nb = pynetbox.api(netbox_url, token=netbox_token, threading=True)
+    if netbox_token.startswith("nbt_"):
+        session.headers.update({"Authorization": f"Bearer {netbox_token}"})
+        nb = pynetbox.api(netbox_url, threading=True)
+    else:
+        nb = pynetbox.api(netbox_url, token=netbox_token, threading=True)
     nb.http_session = session  # Attach the custom session
     logger.debug("NetBox API connection established")
 
