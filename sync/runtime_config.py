@@ -67,6 +67,41 @@ def _sync_interval_seconds() -> int:
     return _read_env_int("SYNC_INTERVAL", default=0, minimum=0)
 
 
+# ---------------------------------------------------------------------------
+#  Field-preservation settings (KEEP_EXISTING_*)
+# ---------------------------------------------------------------------------
+# These flags control whether the sync should overwrite specific fields on
+# existing NetBox devices. Site/tenant/role are NEVER overwritten on existing
+# devices by design; the flags below cover the fields that are normally
+# updated on every sync run.
+# ---------------------------------------------------------------------------
+KEEP_EXISTING_FIELDS = (
+    "NAME",
+    "DEVICE_TYPE",
+    "ASSET_TAG",
+    "STATUS",
+    "INTERFACES",
+    "CUSTOM_FIELDS",
+)
+
+
+def _keep_existing_env(field: str, default: bool = False) -> bool:
+    """Read a single KEEP_EXISTING_<FIELD> boolean env var."""
+    return _parse_env_bool(os.getenv(f"KEEP_EXISTING_{field}"), default=default)
+
+
+def load_keep_existing_settings() -> dict[str, bool]:
+    """
+    Build a {field_lower: bool} map from KEEP_EXISTING_* env vars.
+
+    All flags default to False (preserve current sync behavior) except
+    INTERFACES/CUSTOM_FIELDS which are also False by default.
+    Site/tenant/role are intentionally absent — they are never overwritten
+    on existing devices regardless of these settings.
+    """
+    return {field.lower(): _keep_existing_env(field) for field in KEEP_EXISTING_FIELDS}
+
+
 def _parse_env_list(var_name: str) -> list[str] | None:
     raw_value = os.getenv(var_name)
     if raw_value is None or not str(raw_value).strip():
